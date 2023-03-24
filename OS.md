@@ -2408,7 +2408,7 @@ void sem_signal(sem_t *sem) {
 
 - 偏向写者的读写锁
   - 后序读者必须等待写者进入后才进入
-  - 更加公平
+  - 更加公平，数据更新更及时
 - 偏向读者的读写锁
   - 后序读者可以直接进入临界区
   - 更好的并行性
@@ -2479,12 +2479,431 @@ M个资源 N个线程
 
 <img src="OS.assets/image-20230322153748897.png" alt="image-20230322153748897" style="zoom:15%;" />
 
-安全序列： `P2 -> P1 -> P3`，通过安全性检查，处于安全状态！（执行完P2释放之后，Available 变成 A 3 B 2，可以满足P1的需求，执行完P1释放之后，Available 变成 A 5 B 10，可以满足P3的需求）
+安全序列： `P2 -> P1 -> P3`，通过安全性检查，处于安全状态！（先一次性给P2分配其需要的所有，执行完P2释放之后，Available 变成 A 3 B 2，可以满足P1的需求，一次性给P1分配其需要的所有，执行完P1释放之后，Available 变成 A 5 B 10，可以满足P3的需求）
 
 新来请求：P1请求资源，需要A资源2份，B资源1份
 
 <img src="OS.assets/image-20230322154310392.png" alt="image-20230322154310392" style="zoom:30%;" />
 
-- 假设分配给它，运行安全检查：无法通过
+- 假设分配给它，运行安全检查：无法通过（由于此时P1的所有need没有被完全满足，其无法执行完，因此不会释放拿到的资源，看下一个时不能把available加上P1的allocation；此时available不能满足任何一个线程的need）
 - 采取行动：阻塞P1，保证系统维持在安全状态
+
+
+
+## 同步原语的应用
+
+### 多线程执行屏障：所有线程都要到对应执行点，才能都继续执行（条件变量）
+
+<img src="OS.assets/image-20230324101930092.png" alt="image-20230324101930092" style="zoom:35%;" />
+
+```c++
+lock(&thread_cnt_lock);
+thread_cnt--;
+if (thread_cnt == 0)
+  cond_broadcast(cond);	// 唤醒所有等待的线程
+while(thread_cnt != 0)
+  cond_wait(&cond, &thread_cnt_lock); 
+unlock(&thread_cnt_lock);
+```
+
+### 等待队列工作窃取：做得快的从做得慢的等待队列中窃取任务帮忙做（互斥锁）
+
+`lock(ready_queue_lock[0]);`
+
+### MapReduce：Wordcount任务（条件变量，信号量）
+
+- Mapper：统计一部分文本自述
+- Reducer：一旦其中<u>任意数量</u>的Mapper结束，就累加其结果
+
+```c++
+// 条件变量
+// Mapper
+lock(&finished_cnt_lock);
+finished_cnt++;
+cond_signal(&cond);
+unlock(&thread_cnt_lock);
+
+// Reducer
+lock(&finished_cnt_lock);
+while(finished_cnt == 0)
+  cond_wait(&cond, &finished_cnt_lock);
+/* collect result */	// Reducer起来后，可能发现多个mapper finish
+finished_cnt = 0;	// 一次性拿走所有的finished的Mapper的结果
+unlock(&thread_cnt_lock);
+
+// 信号量，将Mapper的结果视为资源
+// Mapper
+signal(&finish_sem);
+
+// Reducer
+while(finished_cnt != mapper_cnt) {
+  wait(&finish_sem);
+  /* collect result */
+  finished_cnt ++;
+}
+```
+
+两种方式的不同：
+
+- cv可以多个结果一起collect，sem这种只能一次collect一个
+- sem的语义，就是一次只能拿走一个（counter每次只能减一）
+- 但cv更复杂
+
+### 网页渲染：等待<u>所有的请求均完成</u>之后再进行渲染（条件变量，信号量）
+
+```c++
+// 条件变量
+// Request_cb 请求线程
+lock(&glock);
+finished_cnt ++；
+if (finished_cnt == req_cnt)
+  cond_signal(&gcond);
+unlock(&glock);
+
+// 渲染线程
+lock(&glock);
+while (finished_cnt != req_cnt)
+  cond_wait(&gcond, &glock);
+unlock(&glock);
+
+// 信号量
+// Request_cb 请求线程
+signal(&gsem);
+
+// 渲染线程
+while(remain_req != 0) {
+  wait(&gsem);
+  remain_req --;
+}
+```
+
+- 必须所有结束，渲染才能继续（渲染线程处于阻塞状态）
+
+两种方式的不同：
+
+- 信号量的案例中渲染线程会被唤醒多次，条件变量案例中渲染线程只会被调用一次
+- 与barrier场景的区别：barrier不适合用sem，没有什么适合抽象成等待的资源
+
+### 线程池并发控制：控制同一时刻可以执行的线程数量（信号量）
+
+控制同一时刻可以执行的线程数量
+
+原因：有的线程阻塞时可以允许新的线程替上
+
+```c++
+// 信号量，视剩余可并行执行线程数量为有限资源
+thread_routine () {
+  wait(&thread_cnt_sem);
+  /* doing something */
+  signal(&thread_cnt_sem);
+}
+```
+
+### 网页服务器：client向server获取网页，后端更新存在server的网页（读写锁）
+
+- 处理响应客户端获取静态网页需求
+- 处理后端更新静态网页需求
+- 不允许读取更新到一半的页面
+
+client 读锁，后端写锁
+
+<img src="OS.assets/image-20230324103505238.png" alt="image-20230324103505238" style="zoom:30%;" />
+
+## 同步原语选择依据
+
+- 存在多线程同步需求
+  - 保护数据（data）
+    - 存在读多写少
+      - 是：读写锁
+      - 否（或不存在读写场景）：互斥锁
+  - 协调线程执行顺序（order）
+    - 管理有限数量的资源
+      - 是：信号量
+      - 否（复杂逻辑）：条件变量
+
+![image-20230324103531742](OS.assets/image-20230324103531742.png)
+
+
+
+## 同步原语的实现
+
+### <u>原子指令</u>（硬件提供）
+
+保证执行期间不会被打断
+
+- Test-and-set：Intel
+- Compare-and-swap：Intel（悲观）
+- Load-linked & Store-conditional：ARM（乐观）
+- Fetch-and-add：Intel
+
+#### Test-and-set（TAS）
+
+#### Compare-and-swap（CAS）
+
+老的CAS实现会把整个总线都锁住，相当于整个系统中同时能够进行CAS的代码只有一处
+
+#### Load-linked & Store-conditional（LL & SC）
+
+先load一下，读的时候把对应地址的状态记下来，但是如果在后续的执行中有别人修改了，那么在store的时候就会出错，无法成功store进去
+
+> if no one has updated *ptr since the LoadLinked to this address, then change the value of the pointer
+
+```assembly
+retry:	ldxr	x0, addr	# LL 读的时候监视addr
+	cmp	x0, expected
+	bne	out
+	stxr	x1, new_value, addr	# SC 修改的时候看addr是否被其他人修改
+	cbnz	x1, retry	# 没人修改就写成功，否则回到retry
+out:	
+```
+
+系统中可以很多地方同时 LL & SC
+
+#### Fetch-and-add（FAA）
+
+### 锁的实现
+
+#### 自旋锁（Spin Lock）
+
+<img src="OS.assets/image-20230324105317917.png" alt="image-20230324105317917" style="zoom:25%;" />
+
+`atomic_CAS(lock,0,1)`：比较 lock 是否等于0，如果是就把lock修改为1
+
+`*lock = 0`：只有一个人可能同时拿到锁，因此不需要在放锁的时候使用原子指令
+
+**实现**
+
+```c++
+void lock(int *lock) {
+    while(atomic_CAS(lock, 0, 1) 
+	!= 0)
+	/* Busy-looping */ ;
+}
+
+void unlock(int *lock) {
+    *lock = 0;
+}
+```
+
+**问题**
+
+- 有限等待：有的“运气差”的进程可能永远也不能成功CAS => 出现饥饿
+- 空闲让进：依赖于硬件 => 当多个核同时对一个地址执行原子操作时，能否保证至少有一个能够成功（这里我们认为硬件能够确保原子操作make progress）
+
+#### 排号锁（Ticket Lock）：实现有限等待
+
+保证竞争者公平性，按照竞争者到达**顺序**来传递锁
+
+**实现**
+
+```c++
+// owner：当前拿着锁的
+// next：表示目前放号的最新值
+void lock(int *lock) {
+    volatile unsigned my_ticket =
+        atomic_FAA(&lock->next, 1);	// 原子拿号，并递增目前放号的最新值
+    while(lock->owner != my_ticket)	// 等待叫号
+	/* busy waiting */;
+}
+
+void unlock(int *lock) {
+    lock->owner ++;	// 叫下一个号
+}
+```
+
+- 有限等待：按照顺序，在前序竞争者保证有限时间释放时，可以达到有限等待
+
+优化：精准的叫持有对应号的线程来
+
+#### 读写锁
+
+##### <u>偏向读者</u>读写锁实现案例
+
+<img src="OS.assets/image-20230323110716213.png" alt="image-20230323110716213" style="zoom:25%;" />
+
+- Reader计数器：表示有多少读者
+- 第一个/最后一个reader负责获取/释放写锁
+- 只有当完全没有读者时，写者才能进入临界区
+
+**步骤**
+
+读者拿锁：1.获取读者锁，增加读计数器 2.如果没有读者在，拿写锁避免写者进入；有读者在，无需再次获取写锁 3.释放读者锁
+
+读者放锁：1.获取读者锁，减少计数器 2.还有其他读者在，无需释放写锁；无其他读者在，释放写锁，写者可进入临界区 3.释放读者锁
+
+> 注意：读者锁还有阻塞其他读者的语义，因此不能用原子操作来替代
+
+### 条件变量的实现
+
+`yield()`：阻塞自己的线程的系统调用
+
+<img src="OS.assets/image-20230324111310707.png" alt="image-20230324111310707" style="zoom:50%;" />
+
+### 信号量的实现
+
+> 为什么信号量没有lost notification的问题呢？因为counter会记录下notification
+
+```c++
+// 错误实现
+void wait(int S) {
+	while(S <= 0)	// 多个线程都在某线程signal之后，进入对应while，导致资源过度消耗
+		/* Waiting */;
+	atomic_add(&S, -1); 
+} 
+
+void signal(int S) {
+	atomic_add(&S, 1); 
+}
+
+```
+
+```c++
+// 实现-1：忙等
+void wait(sem_t *S) {
+	lock(S->sem_lock);
+	while(S->value == 0) {	// Busy looping，无意义等待
+		unlock(S->sem_lock);
+		lock(S->sem_lock); 	
+	}
+ 	S->value --;	// 此时已经取得sem_lock，防止同时-1
+	unlock(S->sem_lock);
+} 
+
+void signal(sem_t *S) {
+	lock(S->sem_lock);
+	S->value ++;
+	unlock(S->sem_lock);
+}
+
+// 信号量的实现-2：条件变量
+void wait(sem_t *S) {
+	lock(S->sem_lock );
+	while(S->value == 0) {	// 使用条件变量避免无意义等待
+		cond_wait(S->sem_cond, S->sem_lock);
+	}
+ 	S->value --; 
+	unlock(S->sem_lock);
+} 
+
+void signal(sem_t *S) {
+	lock(S->sem_lock);
+	S->value ++;
+	cond_signal(s->sem_cond);	// 每次都要signal，很可能无人等待
+	unlock(S->sem_lock);
+}
+
+// 实现-3：减少signal次数
+void wait(sem_t *S) {
+	lock(S->sem_lock );
+ 	S->value --; 
+	while(S->value < 0) {	// value减到负数代表有人等待
+        // 但是比如S->value = -3，signal 后S->value = -2，还是不满足上面while的条件
+	  cond_wait(S->sem_cond, S->sem_lock);
+	}
+ 	unlock(S->sem_lock);
+} 
+
+void signal(sem_t *S) {
+	lock(S->sem_lock);
+	S->value ++;
+	if (S->value < 0)	// 需要额外的计数器用于单独记录有多少可以唤醒的，加入条件判断是否需要wake
+	  cond_signal(s->sem_cond);
+	unlock(S->sem_lock);
+}
+
+// 实现-4：条件变量 + 互斥锁 + 计数器 = 信号量
+// 新增一个变量 wakeup：等待时可以唤醒的数量
+// value：正数为信号量，负数为有人等待
+// 某一时刻真实的资源数：value < 0 ? wakeup : value + wakeup
+void wait(sem_t *S) {
+     lock(S->sem_lock);
+     S->value --;
+	 if (S->value < 0) {
+                do {
+                        cond_wait(S->sem_cond, S->sem_lock);
+                } while (S->wakeup == 0);
+                S->wakeup --;
+        }
+        unlock(S->sem_lock);
+}
+
+void signal(sem_t *S) {
+        lock(S->sem_lock);
+        S->value ++;
+        if (S->value <= 0) {
+            	// 有人等待
+                S->wakeup ++;
+                cond_signal(S->sem_cond);                
+        }
+        unlock(S->sem_lock);
+}
+// 为何要do while? 有限等待
+// 线程0挂起等待，线程1发signal，之后线程1 wait拿到资源，线程0被唤醒，发现没有可用的资源
+```
+
+## Read Copy Update（RCU）：更高效的读写互斥
+
+对于读写锁的改进，希望让读者即使在有写者写的时候随意读（这样就不一定读到最新的；同时旧值被改写为新的是原子操作，中间状态不会被读到）
+
+思路：写者另拷贝一份数据来进行修改，修改完成之后把指向原本数据的**指针**改为指向拷贝（修改过程是原子性的）（需要将数据抽象为指针，由于硬件对于原子操作修改的大小支持有限）
+
+需要一种能够**类似之前硬件原子操作**的方式，让读者要么看到旧的值，要么看到新的值，不会读到任何中间结果。
+
+#### 单拷贝原子性（Single-copy atomicity）
+
+> 单拷贝原子性（Single-copy atomicity）：处理器任意一个操作的是否能够原子的可见，如更新一个指针
+
+此处原子性的操作是指针更新，而不是具体内容
+
+#### RCU 订阅发布机制
+
+<img src="OS.assets/image-20230324124942388.png" alt="image-20230324124942388" style="zoom:45%;" />
+
+
+
+对于update C可以依据C新创建C'，修改需要更新的字段后，之后更新A的next指向C'
+
+**局限性**
+
+1. 无法使用在复杂场景下如双向链表
+2. 需要在**合适**的时间，**回收**无用的旧拷贝
+
+
+
+问题：无用的旧拷贝（**更新**完指针时，还有读者在被修改前的数据上读，此时不能回收。需要知道读之前旧拷贝的读者什么时候读完）
+
+#### RCU 宽限期
+
+需要知道读临界区什么时候开始，什么时候结束
+
+**最后一个可能看到旧拷贝的读者离开临界区，才能够回收旧拷贝**
+
+```c++
+void rcu_reader() {
+	RCU_READ_START();	// 通知RCU，读者进临界区了
+
+	/* Reader Critical Section */
+
+	RCU_READ_STOP();	// 通知RCU，读者出临界区了
+}
+// 可以使用计数器实现，有多少 reader 还在临界区内
+```
+
+
+
+## RCU 与 读写锁 对比
+
+相同点：允许读者并行
+
+不同点：
+
+- 读写锁
+  - 读者也需要上读者锁
+  - 关键路径上有额外开销
+  - 方便使用
+  - 可以选择对写者开销不大的读写锁
+- RCU
+  - 读者无需上锁
+  - 使用较繁琐
+  - 写者开销大
 

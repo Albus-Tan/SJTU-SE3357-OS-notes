@@ -4180,7 +4180,279 @@ inode map：用来索引所有 inode，记录他们的位置（不断往后写�
 
 
 
+# 新型存储设备的文件系统
 
+## 磁盘结构与性能特性
+
+<img src="OS.assets/image-20230414171213028.png" alt="image-20230414171213028" style="zoom:33%;" />
+
+- 顺序读写的速度远远大于随机读写（差距100倍左右）
+
+## 瓦式磁盘 Shingled Magnetic Recording (SMR) Disk
+
+观察：读写磁头宽度要求不同（写的宽，读的窄）
+
+思想：通过重叠压缩磁道宽度
+
+- 传统磁盘密度难以提升：写磁头的宽度难以减小
+- 瓦式磁盘将磁道重叠，提升存储密度：减小读磁头的宽度
+
+问题：随机写会覆盖后面磁道的数据，只能顺序写入；修改已经写过的数据很麻烦
+
+- 避免整个磁盘只能顺序写入
+  - 磁盘划分成多个Band，Band间增大距离，不同Band可随机写（间隔宽度正常）
+  - 每个Band内必须顺序写入
+  
+  <img src="OS.assets/image-20230413101131666.png" alt="image-20230413101131666" style="zoom: 50%;" />
+
+**Band内随机写怎么办？**
+
+- 方法一：多次拷贝
+
+  - 修改Band X中的4KB数据
+    1. 找到空闲Band Y
+    2. 从Band X的数据拷贝到Band Y，拷贝时将4KB修改写入
+    3. 将Band Y中的数据拷贝回Band X
+  - 很少的随机写会导致很多的拷贝与访问
+
+- 方法二：缓存+动态映射
+
+  修改时随机写放到磁盘大容量持久缓存中并标记；等空闲时候统一顺序写回瓦式磁盘
+  
+  - 大容量持久缓存（结构同传统磁盘）
+    - 在磁盘头部预留的区域，磁道不重叠，可随机写入
+    - 给固件（STL）单独使用，外部不可见
+  - 动态映射：Shingle Translation Layer (STL)
+    - 从外部（逻辑）地址（OS给的地址）到内部（物理）地址的映射
+  - 修改Band X中的4KB数据
+    1. 将修改写入缓存，标记Band X为dirty
+    2. 修改STL映射（让原位置指向持久化缓存）
+    3. 空闲时，根据缓存内容，清理 dirty Band
+  - 4KB随机写 → 修改4KB缓存
+
+**瓦式磁盘种类**
+
+| SMR磁盘种类                  | 接口           | 随机写处理方法               |
+| ---------------------------- | -------------- | ---------------------------- |
+| Drive-managed  SMR  (DM-SMR) | 普通块设备接口 | 固件进行缓存和清理           |
+| Host-aware  SMR  (HA-SMR)    | 特殊指令接口   | 固件进行缓存和清理           |
+| Host-managed  SMR  (HM-SMR)  | 特殊指令接口   | 必须顺序写，随机写请求被拒绝 |
+
+### 如何改进Ext4来适应瓦式磁盘？
+
+**DM-SMR上使用Ext4**
+
+当随机写入时，Ext4吞吐量非常低！
+
+（刚开始的时候非常快（比传统的还快），因为写的是缓存部分（传统磁盘），同时是顺序写）
+
+**观察：持久缓存对吞吐量的影响**
+
+<img src="OS.assets/image-20230414195952987.png" alt="image-20230414195952987" style="zoom:33%;" />
+
+- 随机写的跨度小→ 脏band数量少 → 清理时的工作量少 → 吞吐量高
+- Ext4的元数据非常分散（在各个块组中），分散在很多band上
+
+**Ext4上的元数据写回**
+
+<img src="OS.assets/image-20230413102957644.png" alt="image-20230413102957644" style="zoom:33%;" />
+
+- 频繁的元数据写回，造成大量的分散随机写，降低吞吐量
+- 不修改磁盘布局，**引入Indirection（加一层）**：以LFS形式增加一个元数据缓存（把日志变成LFS，内存中维护journal map，将本来要写回到内存的位置重新映射回journal所在的位置；读S的时候不会读到S的区域，而会读到journal）
+
+<img src="OS.assets/image-20230414200325763.png" alt="image-20230414200325763" style="zoom: 33%;" />
+
+**断电后内存中的jmap没了？**
+
+通过扫描日志，恢复还原jmap即可（恢复存储的所有S到J到映射）
+
+**日志满了怎么办？**
+
+- 日志空间清理
+  - 无效的元数据（被新修改覆盖过的元数据）可以直接被回收
+  - 对于冷的元数据，可将其写回到Ext4中其原本的位置*S*
+  - 热的元数据继续保留在日志中
+
+
+
+## 闪存盘的文件系统（Flash Disk）：NAND
+
+<img src="OS.assets/image-20230413104117947.png" alt="image-20230413104117947" style="zoom:25%;" />
+
+- 闪存盘：层次化的方式一层一层嵌套组织
+
+<img src="OS.assets/image-20230413104233118.png" alt="image-20230413104233118" style="zoom:33%;" />
+
+- 多个channel可以同时执行读/写请求
+
+**闪存盘的性质**
+
+为了写一个page，需要把这个page所在的block全部擦掉（只能在**空的**block上写页）
+
+- 非对称的读写与擦除操作
+  - 页 (page) 是读写单元 (8-16KB)
+  - 块 (block) 是擦除单元 (4-8MB)
+- Program/Erase cycles
+  - 写入前需要先擦除
+  - 每个块被擦除的次数是有限的
+- 随机访问性能
+  - 没有寻道时间
+  - 随机访问的速度提升，但仍与顺序访问有一定差距
+- 磨损均衡
+  - 频繁写入同一个块会造成写穿问题
+    - 如果EXT4直接用，元数据块肯定先磨损
+  - 将写入操作均匀的分摊在整个设备
+- 多通道：多通道同时写，高并行性
+- 异质Cell：存储1到4个比特：SLC 、MLC、TLC、 QLC（single， multiple，triple...）
+  - SLC最贵，但是最快，耐磨度也最好
+
+### Flash Translation Layer (FTL)
+
+- **逻辑地址到物理地址的转换**
+  - 对外使用逻辑地址
+  - 内部使用物理地址
+  - 可软件实现，也可以固件实现
+  - 用于垃圾回收、数据迁移、磨损均衡（wear-levelling）等
+
+<img src="OS.assets/image-20230413110415904.png" alt="image-20230413110415904" style="zoom:33%;" />
+
+<img src="OS.assets/image-20230413110448980.png" alt="image-20230413110448980" style="zoom:33%;" />
+
+### F2FS文件系统： Flash Friendly File System
+
+**LFS 问题**
+
+- LFS的问题1：递归更新问题
+
+  修改数据之后，之后要修改所有直接间接指向这块数据的块
+
+  ![image-20230413110624380](OS.assets/image-20230413110624380.png)
+
+- LFS的问题2：对于单一log顺序写入，无法利用到现代Flash设备的高并行性（无法同时写）
+
+解决：逻辑块号上面加了一层indirection
+
+- F2FS的改进1：NAT（Node Address Table）
+
+  ![image-20230413110855586](OS.assets/image-20230413110855586.png)
+
+  ![image-20230414202904902](OS.assets/image-20230414202904902.png)
+
+  ![image-20230414203105156](OS.assets/image-20230414203105156.png)
+
+  node：inode中的间接多级的部分
+
+- F2FS的改进2：多log并行写入
+
+  需要对数据进行分类，不同类并行写
+  
+  **闪存友好的磁盘布局**
+  
+  ![image-20230414203540414](OS.assets/image-20230414203540414.png)
+  
+  ![image-20230413111716292](OS.assets/image-20230413111716292.png)
+
+## 非易失性内存 Non-volatile Memory (NVM)
+
+重启后，内存里面的数据还在
+
+**NVDIMM**
+
+- 在内存条上加上Flash和超级电容（足够把DRAM中的数据转移到Flash中的电量）
+  - 平时数据在DRAM中；断电后转移到Flash中持久保存
+- 容量很难再提升
+
+**Intel Optane DC Persistent Memory**
+
+内存接口；字节寻址；持久保存数据；高密度 (单条512GB/DIMM)；需要磨损均衡，但耐磨度比NAND好10倍；比DRAM慢十倍以内，比NAND快1000倍
+
+### 非易失性内存带来的新问题
+
+断电之后NVM里面的数据没有丢，但是CPU缓存里面的数据丢了
+
+<img src="OS.assets/image-20230413112316992.png" alt="image-20230413112316992" style="zoom:33%;" />
+
+#### 内存写入顺序
+
+Writeback模式的CPU缓存：虽然能提升性能，但会打乱数据写入内存的顺序
+
+<img src="OS.assets/image-20230414204023072.png" alt="image-20230414204023072" style="zoom:33%;" />
+
+考虑持久性和一致性，写入顺序很重要
+
+<img src="OS.assets/image-20230414204043315.png" alt="image-20230414204043315" style="zoom:33%;" />
+
+读到valid以为D都已经成功写入，但是实际上是因为cache的策略导致V在两个D之前写入NVM，并且cache断电后里面的数据丢失
+
+**解决**
+
+- 关闭CPU缓存？
+- 使用Write-through模式的缓存？
+- 每次写入后刷除整个缓存？
+
+**使用CLFLUSH保证顺序**（cacheline flush）
+
+<img src="OS.assets/image-20230413112833729.png" alt="image-20230413112833729" style="zoom: 43%;" />
+
+**Intel x86 拓展指令集**
+
+<img src="OS.assets/image-20230413113016250.png" alt="image-20230413113016250" style="zoom:33%;" />
+
+CLWB不会把缓存清掉
+
+**案例：NVM上的写时复制**
+
+<img src="OS.assets/image-20230414204550262.png" alt="image-20230414204550262" style="zoom:33%;" />
+
+- SFENCE：保证写入顺序
+- CLWB R' 为 commit point
+
+<img src="OS.assets/image-20230414204610009.png" alt="image-20230414204610009" style="zoom:33%;" />
+
+### 非易失性内存文件系统 Non-volatile Memory File System
+
+何必要用文件接口来访问非易失性内存？可以把对应的存储层干掉
+
+<img src="OS.assets/image-20230415001617228.png" alt="image-20230415001617228" style="zoom:33%;" />
+
+**PMFS**
+
+<img src="OS.assets/image-20230415001853463.png" alt="image-20230415001853463" style="zoom:33%;" />
+
+**PMFS中的一致性保证**
+
+- 现有方法
+  - 写时复制 (Shadow Paging)：用于文件数据更新
+  - 日志：用于元数据更新，如inode
+  - Log-structured updates
+- NVM专有的方法
+  - 原子指令更新：用于小修改
+
+**拓展的原子指令更新**
+
+- 8字节更新
+  - CPU原本就支持8字节的原子更新
+  - 更新inode的访问时间
+- 16字节更新 
+  - 使用 *cmpxchg16b* 指令
+  - 同时更新inode中的文件大小和修改时间
+- 64字节更新
+  - 使用硬件事务内存（HTM）
+  - 更新inode中的多个数据
+
+**让应用直接访问NVM**
+
+<img src="OS.assets/image-20230415002458998.png" alt="image-20230415002458998" style="zoom:33%;" />
+
+底层内存接口通过NVMFS变成文件系统接口，再通过memory map变成内存接口
+
+**如何防止NVM上的wild writes？**
+
+<img src="OS.assets/image-20230415002642545.png" alt="image-20230415002642545" style="zoom:33%;" />
+
+### 不同NVM文件系统的层次
+
+![image-20230415002808272](OS.assets/image-20230415002808272.png)
 
 
 

@@ -5250,7 +5250,14 @@ Linux设备分类
 
 - 虚拟机监控器主要需要关注系统ISA
 
-### 系统虚拟化的流程：Trap & Emulate
+### 系统虚拟化的流程：<u>Trap & Emulate</u>
+
+- Trap：在用户态EL0执行特权指令将陷入EL1的VMM中
+- Emulate：这些指令的功能都由VMM内的函数实现
+
+![image-20230425100451010](OS.assets/image-20230425100451010.png)
+
+每当执行某种特殊 system ISA 时，都会下陷 Trap，之后由内核 VMM 模拟（如上VM希望写页表基地址 `MSR ttbr0_el1, x0`，这是 system ISA，在这一瞬间会触发 Trap 进入内核，内核会判断该写是否合法，合法则会真的执行指令的功能）
 
 - 第一步（Trap）
   - 捕捉所有系统ISA并陷入/下陷
@@ -5275,6 +5282,10 @@ Linux设备分类
 ![image-20230423111524952](OS.assets/image-20230423111524952.png)
 
 ## 虚拟化功能
+
+虚拟机VM放用户态，虚拟机监控器VMM放内核态
+
+前提：用户态调用特权指令，就一定会触发异常，发生下陷
 
 ### 第一版：支持只有内核态的虚拟机
 
@@ -5308,6 +5319,48 @@ Linux设备分类
 - 根据irq_bit决定插入虚拟时钟中断vIRQ并调用irq_handler（ret后还要让控制流回去）
 
 <img src="OS.assets/image-20230423112442995.png" alt="image-20230423112442995" style="zoom:25%;" />
+
+**正常无虚拟化时中断的流程**（有 Host 中包括 handler，以及 Thread）
+
+1. irq_bit为1时，接收到中断，硬件会把控制流转换给irq_handler
+2. 之后handler需要保存上下文（硬件寄存器和内存内容都是下陷之前的状态，handler处理完之后还都要恢复回去！）
+3. 执行handler处理函数
+4. handler加载恢复上下文
+5. 返回到原控制流
+
+**虚拟化时的中断流程**
+
+1. irq_bit为1时，硬件接收到中断，会把控制流转换给内核态VMM
+2. 进入VMM对应的中断处理函数handler，保存上下文
+3. 插入虚拟时钟中断，调用对应handler
+4. 加载恢复上下文（原本控制流的上下文，而不是handler处理函数所在位置的上下文，“内核”不需要保存上下文！），此时handler看到的状态就是下陷的一瞬间的上下文
+5. 之后handler需要保存上下文
+6. 执行handler处理函数
+7. handler加载恢复上下文（用户态状态，而不是虚拟机中内核的状态，虚拟机中内核不需要保存状态，出来后丢掉即可）
+8. 进入 VMM，保存上下文
+9. 离开 VMM，恢复上下文
+10. 返回到原控制流
+
+**VMM的逻辑**
+
+```shell
+int reason // 记录下陷原因
+
+save_context // 保存上下文
+
+switch(reason){
+	case(...): ...	// 调用对应的处理函数
+	case(...): ...
+	...
+}
+
+restore_context // 恢复上下文
+
+struct VM_CTX {
+	int user_node // 区分这个 VM 跑的是用户/操作系统内核
+	ctx // 寄存器状态
+};
+```
 
 ### 第三版：支持虚拟机内单一用户态线程
 
@@ -5383,15 +5436,383 @@ VM 内核态内部有多个context，内部也要有相应的调度机制和策�
 **VM的能力（与第六版的区别）**
 
 - 虚拟机有多个Virtual CPU (vCPU)
+- vCPU 是一种软件抽象
 
 **VMM的实现**
 
 - 在VM_runqueue中标记出VM和vCPU的类型
-  - VMM内核态维护某个VM的vCPU的context（类似一个进程里面多个线程，调度的是线程，不关心一个进程里面究竟有多少线程）
+  - VMM内核态维护某个VM的vCPU的context
+  - 调度的单位是vCPU（VM类似于进程，vCPU类似于线程；类似一个进程里面多个线程，调度的是线程，不关心一个进程里面究竟有多少线程）
+    - 用户期待这些 vCPU 能够同时运行，但是实际上不是“同时”跑
 
 <img src="OS.assets/image-20230423113846975.png" alt="image-20230423113846975" style="zoom:25%;" />
 
+> 虚拟化中的锁：内核中如果使用了spinlock，拿锁后如果对应的vCPU被虚拟机监控器调度走了，那么别的等锁的人spin的时间会大大增加
 
+# 处理器虚拟化
+
+## ARM不是严格的可虚拟化架构
+
+- 敏感指令
+  - 读写特殊寄存器或更改处理器状态
+  - 读写敏感内存：例如访问未映射内存、写入只读内存
+  - I/O指令
+- 特权指令
+  - 在用户态执行会触发**异常**，并陷入内核态
+
+在ARM中：不是所有敏感指令都属于特权指令**（不是所有 system ISA 在用户态执行的时候会触发 Trap！不会到“内核”中，也即 VMM 内核态不知道发生了什么）**
+
+- 例子: CPSID/CPSIE指令
+  - CPSID和CPSIE分别可以关闭和打开中断
+  - 内核态执行：PSTATE.{A, I, F} 可以被CPS指令修改
+  - 在用户态执行：CPS 被当做NOP指令，不产生任何效果
+    - 不是特权指令
+
+## 如何处理这些不会下陷的敏感指令？
+
+处理这些不会下陷的敏感指令，使得虚拟机中的操作系统能够运行在用户态（EL-0）
+
+- 方法1：解释执行
+- 方法2：二进制翻译
+- 方法3：半虚拟化
+- 方法4：硬件虚拟化（改硬件）
+
+### 方法1：解释执行
+
+不直接运行代码；把代码全部当成数据，一条条拿出来看（每一条指令都 fetch-decode-execute），来进行模拟
+
+- 使用软件方法一条条对虚拟机代码进行模拟
+  - 不区分敏感指令还是其他指令
+  - 没有虚拟机指令直接在硬件上执行
+- 使用内存维护虚拟机状态（自己假装成硬件，需要维护伪硬件状态）
+  - 例如：使用uint64_t x[30]数组保存所有通用寄存器的值
+
+![image-20230425104100565](OS.assets/image-20230425104100565.png)
+
+1. 看当前内部维护的PC值
+2. 从维护的内存里去找对应代码，拿出来，根据 decode 的结果去调用内部维护的这些 execute 的函数
+3. 在 execute 过程中会不断读写内存，修改虚拟机状态
+4. 更新 PC 值，之后执行下一条
+
+**案例**
+
+![image-20230425104219928](OS.assets/image-20230425104219928.png)
+
+**优缺点**
+
+- 优点：
+  - 解决了敏感函数不下陷的问题
+  - **可以模拟不同ISA的虚拟机**（比如可以在X86物理机上模拟ARM虚拟机）
+  - 易于实现、复杂度低
+- 缺点：
+  - **非常慢**：任何一条虚拟机指令都会转换成多条模拟指令
+
+### 方法2：二进制翻译
+
+先翻译，再执行
+
+- 提出两个加速技术
+  - 在执行前**批量翻译**虚拟机指令（提前把需要处理的指令翻译成能够下陷的指令，其他不相关的不管直接忽略）
+  - **缓存**已翻译完成的指令
+- 使用基本块(Basic Block)的翻译粒度
+  - 每一个基本块被翻译完后叫代码补丁
+
+> 基本块(Basic Block)：从头执行到尾，中间没有 if while 等等循环和条件判断
+
+![image-20230425104541232](OS.assets/image-20230425104541232.png)
+
+**二进制翻译的 Basic Blocks**
+
+<img src="OS.assets/image-20230425105928201.png" alt="image-20230425105928201" style="zoom:25%;" />
+
+`cli`：关中断	`sti`：开中断	`cr3`：x86 页表基地址
+
+**二进制翻译举例**
+
+<img src="OS.assets/image-20230425110018628.png" alt="image-20230425110018628" style="zoom:35%;" />
+
+比较重要的指令进行翻译（翻译成准备好的函数调用），之后为了性能也可以展开 call
+
+<img src="OS.assets/image-20230425110222545.png" alt="image-20230425110222545" style="zoom:35%;" />
+
+**缺点**
+
+- 不能处理自修改的代码(Self-modifying Code)
+- 中断插入粒度变大
+  - 模拟执行可以在任意指令位置插入虚拟中断
+  - **二进制翻译时只能在基本块边界插入虚拟中断**（翻译完之后块内部的指令不会下陷，都是直接call准备好的函数，不会再下陷通知VMM；只有下陷的时候才会看到有什么中断）
+
+### <u>方法3：半虚拟化 (Para-virtualization)</u>
+
+把用户态不能够下陷的代码换了，直接调用 VMM 提供的接口
+
+- 协同设计
+  - 让VMM提供接口给虚拟机，称为**Hypercall**
+  - **修改操作系统源码，让其主动调用VMM接口**
+- **Hypercall可以理解为VMM提供的系统调用**
+  - 在ARM中是HVC指令
+- 将所有不引起下陷的敏感指令替换成超级调用
+- batch：对于需要下陷的操作，不是一个一个做，而是等一批来了之后，再进行处理
+
+如 Xen
+
+**优缺点**
+
+- 优点：
+  - 解决了敏感函数不下陷的问题
+  - 协同设计的思想可以提升某些场景下的系统性能
+    - I/O等场景
+- 缺点：
+  - 需要修改操作系统代码，难以用于闭源系统
+  - 即使是开源系统，也难以同时在不同版本中实现
+
+### <u>方法4：硬件虚拟化（改硬件）</u>
+
+- x86和ARM都引入了全新的虚拟化特权级
+- x86引入了root模式和non-root模式
+  - Intel推出了VT-x硬件虚拟化扩展
+  - Root模式是最高特权级别，控制物理资源
+  - VMM运行在root模式，虚拟机运行在non-root模式
+  - 两个模式内都有4个特权级别：Ring0~Ring3
+- ARM引入了EL2
+  - VMM运行在EL2
+  - EL2是最高特权级别，控制物理资源
+  - VMM的操作系统和应用程序分别运行在EL1和EL0
+
+#### Intel VT-x
+
+##### VT-x的处理器虚拟化
+
+![image-20230425112029332](OS.assets/image-20230425112029332.png)
+
+X86中内核态Ring0，用户态Ring3
+
+|        | Root      | Non-root            |
+| ------ | --------- | ------------------- |
+| 用户态 | 管理 Tool | 虚拟机 Guest App    |
+| 内核态 | VMM       | 虚拟机 Guest Kernel |
+
+- **虚拟机 Guest Kernel 中发生的任何 system ISA 都会 trap 下来，从 Non-root 模式 trap 到 root 模式内核态（VMM），VMM 通过 switch 处理后，返回虚拟机 Guest Kernel**
+- 一些优化：虚拟机 Guest Kernel 在 non-root 模式下配置页表 CR3 不需要下陷（VMM 与 虚拟机 Guest Kernel 有各自的 CR3，下陷时硬件需要负责保存/恢复 CR3，保存恢复的位置？VMCS）
+- Non-root 虚拟机 Guest App 调用 syscall 会直接下陷到虚拟机 Guest Kernel（除非设置对应 bit）
+
+##### Virtual Machine Control Structure (VMCS) ：硬件自动存/取状态，减少下陷带来的cycle性能开销
+
+整个系统起来之后，VMM会提供给硬件的内存页（4KB）作为VMCS：记录与当前VM运行相关的所有状态（比如寄存器）
+
+- VM Entry
+  - 硬件自动将当前CPU中的VMM状态保存至VMCS
+  - 硬件硬件自动从VMCS中加载VM状态至CPU中
+- VM Exit
+  - 硬件自动将当前CPU中的VM状态保存至VMCS
+  - 硬件自动从VMCS加载VMM状态至CPU中
+
+包含6个部分
+
+- Guest-state area：发生VM exit时，CPU的状态会被硬件自动保存至该区域；发生VM Entry时，硬件自动从该区域加载状态至CPU中
+- Host-state area：发生VM exit时，硬件自动从该区域加载状态至CPU中；发生VM Entry时，CPU的状态会被自动保存至该区域
+- VM-execution control fields： 控制Non-root模式中虚拟机的行为
+- VM-exit control fields：控制VM exit的行为
+- VM-entry control fields：控制VM entry的行为
+- VM-exit information fields：VM Exit的原因和相关信息（只读区域）
+
+##### VT-x的执行过程
+
+事件驱动的设计
+
+<img src="OS.assets/image-20230427215918577.png" alt="image-20230427215918577" style="zoom:15%;" />
+
+1. 启动虚拟机 VMLAUNCH
+2. 虚拟机发生下陷，VM Exit，到 VMX Root
+
+**<u>每一个跑的 VM 的 vCPU 都会有一个 VMCS</u>**
+
+> **8个核，上面10个VM虚拟机，每个虚拟机4个vCPU，需要多少VMCS？**
+>
+> VMCS为vCPU服务，有多少vCPU就有多少VMCS；需要 4*10 = 40 个
+
+#### ARM的虚拟化技术
+
+##### ARM的处理器虚拟化
+
+<img src="OS.assets/image-20230427101023889.png" alt="image-20230427101023889" style="zoom:33%;" />
+
+- EL2 专门为运行 VMM 准备
+- 每一层 EL 都有自己的一套寄存器（_ELX结尾），也即在VM与VMM之间切换时，不需要再有硬件来把寄存器状态存储/恢复（因为切换特权级后不会覆盖原本的寄存器，留着原本特权级的寄存器不动即可）
+  - 当然如果在多个VM之间切换时（类似于线程切换），还是需要保存上下文，因为VM都运行在相同特权级，并且共用寄存器
+
+##### ARM的VM Entry和VM Exit
+
+- VM Entry
+  - 使用ERET指令从VMM进入VM
+  - 在进入VM之前，VMM需要主动加载VM状态
+  - VM内状态：通用寄存器、系统寄存器、
+  - VM的控制状态：HCR_EL2、VTTBR_EL2等
+- VM Exit
+  - 虚拟机执行敏感指令或收到中断等
+  - 以Exception、IRQ、FIQ的形式回到VMM
+  - 调用VMM记录在vbar_el2中的相关处理函数
+  - 下陷第一步：VMM主动保存所有VM的状态
+
+##### ARM硬件虚拟化的新功能
+
+- ARM中没有VMCS
+- VM能直接控制EL1和EL0的状态
+  - 自由地修改PSTATE(VMM不需要捕捉CPS指令)
+  - 可以读写TTBR0_EL1/SCTRL_EL1/TCR_EL1等寄存器
+- VM Exit时VMM仍然可以直接访问VM的EL0和EL1寄存器
+
+##### HCR_EL2寄存器简介
+
+- HCR_EL2：VMM控制VM行为的系统寄存器
+  - VMM有选择地决定VM在某些情况时下陷
+  - 和VT-x VMCS中VM-execution control area类似
+- 在VM Entry之前设置相关位，控制虚拟机行为
+
+##### ARMv8.0中的Type-2 VMM架构
+
+![image-20230427102627988](OS.assets/image-20230427102627988.png)
+
+- KVM/ARM Lowvisor：只负责进行状态保存/恢复和转发
+
+##### ARMv8.1中的Type-2 VMM架构
+
+- ARMv8.1
+  - 推出Virtualization Host Extensions(VHE)，在HCR_EL2.E2H打开
+    - 寄存器映射
+    - 允许与EL0共享内存
+  - 使EL2中可直接运行未修改的操作系统内核（Host OS）
+
+![image-20230427103052434](OS.assets/image-20230427103052434.png)
+
+打开 E2H bit 之后，硬件会自动把 `_EL1` 寄存器翻译成 `_EL2` 
+
+![image-20230427103305680](OS.assets/image-20230427103305680.png)
+
+性能好，结构简单
+
+#### VT-x和VHE对比
+
+|                                    | **VT-x**       | **VHE**            |
+| ---------------------------------- | -------------- | ------------------ |
+| 新特权级                           | Root和Non-root | EL2                |
+| 是否有VMCS？                       | 是             | 否                 |
+| VM  Entry/Exit时硬件自动保存状态？ | 是             | 否                 |
+| 是否引入新的指令？                 | 是(多)         | 是(少)             |
+| 是否引入新的系统寄存器?            | 否             | 是(多) (EL2寄存器) |
+| 是否有扩展页表(第二阶段页表)?      | 是             | 是                 |
+
+#### Type-1和Type-2在VT-x和VHE下架构
+
+![image-20230427103620108](OS.assets/image-20230427103620108.png)
+
+## 案例：QEMU/KVM
+
+**QEMU**
+
+最初目标是在非x86机器上使用动态二进制翻译技术模拟x86机器，之后能模拟出多种不同架构的虚拟机
+
+- 初始阶段QEMU一直使用软件方法进行模拟，如二进制翻译技术
+- QEMU 0.10.1开始使用KVM (Kernel-based Virtual Machine)，以替代其软件模拟的方案
+
+**QEMU/KVM架构**
+
+- QEMU运行在用户态，负责实现策略
+  - 也提供虚拟设备的支持
+- KVM以Linux内核模块运行，负责实现机制
+  - 可以直接使用Linux的功能
+  - 例如内存管理、进程调度
+  - 使用硬件虚拟化功能
+- 两部分合作
+  - KVM捕捉所有敏感指令和事件，传递给QEMU
+  - KVM不提供设备的虚拟化，需要使用QEMU的虚拟设备
+
+
+
+// TODO switch case
+
+- 内核态 KVM 为用户态的 QEMU 提供接口，供（）
+- 内核态的 KVM 如果 switch case 处理不完，会把控制权转交给 QEMU
+
+**<u>进程和虚拟机对应，线程和vCPU对应</u>**
+
+
+
+### QEMU/KVM的流程
+
+![image-20230427110528833](OS.assets/image-20230427110528833.png)
+
+
+
+# 内存虚拟化 Memory Virtualization
+
+**为什么需要内存虚拟化 ?**
+
+内核会以为自己独占物理内存，并且直接看到的是物理地址，基于此向上层提供虚拟地址的抽象；但是显然要在一台机器上运行多台虚拟机，不可能让一个物理机上的各个虚拟机互相看到对方的内存，也即不可能让虚拟机看到真实的物理地址
+
+需要再加一层，提供虚拟地址！
+
+- 操作系统内核直接管理物理内存
+  - 物理地址从0开始连续增长
+  - 向上层进程提供虚拟内存的抽象
+- 如果VM使用的是真实物理地址
+
+## 内存虚拟化的目标
+
+- 为虚拟机提供虚拟的物理地址空间
+  - 物理地址从0开始连续增长
+- 隔离不同虚拟机的物理地址空间
+  - VM-1无法访问其他的内存
+
+## 三种地址
+
+- 客户虚拟地址(Guest Virtual Address, GVA)
+  - 虚拟机内进程使用的虚拟地址，通常说的虚拟地址
+- **客户物理地址(Guest Physical Address, GPA)** [VMM管理]
+  - 虚拟机内使用的“假”物理地址
+- 主机物理地址(Host Physical Address, HPA) [VMM管理]
+  - 真实寻址的物理地址
+  - GPA需要翻译成HPA才能访存
+
+## 怎么实现内存虚拟化?
+
+1. 影子页表(Shadow Page Table)
+2. 直接页表(Direct Page Table)
+3. 硬件虚拟化：目前使用最多
+
+### 影子页表 (Shadow Page Table)
+
+![image-20230427112013358](OS.assets/image-20230427112013358.png)
+
+但是真的在 MMU 里面翻译，只能有一个页表！需要合二为一
+
+- MMU 实际上只知道虚拟地址翻译到物理地址，而不管究竟地址的逻辑意义；给页表就能翻译
+- 最终页表直接把 GVA 翻译成 HPA（影子页表 SPT，对 Guest 不可见）
+
+#### 2个页表 → 1个页表
+
+1. 把页表的基地址写入 CR3（VMM intercepts guest OS setting the virtual CR3）
+2. （VMM iterates over the guest page table, constructs a corresponding shadow page table）
+
+1.In shadow PT, every guest physical address is translated into host physical address
+
+2.Finally, VMM loads the host physical address of the shadow page table
+
+
+
+困难点在于：
+
+Guset OS 修改页表时候改的是 GPT，而实际使用的是 SPT
+
+每次 Guset OS 想要修改页表的时候 Trap（给页表 GPT 所在的那块内存的内存页设置只读权限！只要 Guest OS 只要写，就会发生 Trap 到内核态）
+
+配置 SPT 设置页表 GPT 所在的那块内存的内存页为只读权限（因为此时硬件真实使用的页表是 SPT）
+
+
+
+### 直接页表 (Direct Page Table)
+
+### 硬件虚拟化
 
 
 
